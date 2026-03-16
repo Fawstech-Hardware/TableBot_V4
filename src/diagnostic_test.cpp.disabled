@@ -1,0 +1,307 @@
+/*
+ * ══════════════════════════════════════════════════════════════
+ *  DIAGNOSTIC TEST — Motor + IMU + Encoder Straight Line Test
+ *  
+ *  HOW TO USE:
+ *  1. Rename this file to "main.cpp" (and rename the real main.cpp
+ *     to "main.cpp.disabled" temporarily)
+ *  2. Upload to ESP32
+ *  3. Open Serial Monitor at 115200 baud
+ *  4. Send 'g' to start driving straight for 5 seconds
+ *  5. Send 's' to stop at any time
+ *  6. Watch the live sensor data print every 100ms
+ *  
+ *  WHAT IT TESTS:
+ *  - Both motors spin and the robot drives straight
+ *  - IMU (MPU6050) heading correction is working
+ *  - Encoders are counting ticks
+ *  - All 4 IR edge sensors read correctly
+ * ══════════════════════════════════════════════════════════════
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include "config.h"
+
+// ── Encoder ISR ──
+volatile long encTicksL = 0;
+volatile long encTicksR = 0;
+
+void IRAM_ATTR isrL() {
+  if (digitalRead(ENC_L_B) == HIGH) encTicksL++;
+  else encTicksL--;
+}
+
+void IRAM_ATTR isrR() {
+  if (digitalRead(ENC_R_B) == HIGH) encTicksR++;
+  else encTicksR--;
+}
+
+// ── MPU6050 ──
+float gyroZoffset = 0;
+float yaw = 0;
+unsigned long lastMPU = 0;
+bool mpuOK = false;
+
+void initMPU() {
+  Wire.begin(MPU_SDA, MPU_SCL);
+  Wire.setClock(400000);
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("[MPU] ERROR: Not found!");
+    mpuOK = false;
+    return;
+  }
+
+  // Gyro range ±250°/s
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1B);
+  Wire.write(0x00);
+  Wire.endTransmission();
+
+  // Low-pass filter ~44Hz
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1A);
+  Wire.write(0x03);
+  Wire.endTransmission();
+
+  mpuOK = true;
+  Serial.println("[MPU] Found! Calibrating (hold still)...");
+
+  float sum = 0;
+  for (int i = 0; i < 200; i++) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x47);
+    Wire.endTransmission(false);
+    Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)2);
+    int16_t raw = (Wire.read() << 8) | Wire.read();
+    sum += raw;
+    delay(5);
+  }
+  gyroZoffset = sum / 200.0f;
+  yaw = 0;
+  lastMPU = micros();
+  Serial.printf("[MPU] Calibrated. Offset=%.1f\n", gyroZoffset);
+}
+
+void updateMPU() {
+  if (!mpuOK) return;
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x47);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)2);
+  if (Wire.available() < 2) return;
+
+  int16_t raw = (Wire.read() << 8) | Wire.read();
+  float gyroZ = (raw - gyroZoffset) / GYRO_SCALE;
+
+  unsigned long now = micros();
+  float dt = (now - lastMPU) / 1000000.0f;
+  lastMPU = now;
+
+  if (abs(gyroZ) > 1.0f) {
+    yaw += gyroZ * dt;
+  }
+}
+
+// ── Motor Control ──
+void setupMotors() {
+  pinMode(MOTOR_L_IN1, OUTPUT);
+  pinMode(MOTOR_L_IN2, OUTPUT);
+  pinMode(MOTOR_R_IN1, OUTPUT);
+  pinMode(MOTOR_R_IN2, OUTPUT);
+
+  ledcSetup(PWM_CH_L, PWM_FREQ, PWM_RES);
+  ledcSetup(PWM_CH_R, PWM_FREQ, PWM_RES);
+  ledcAttachPin(MOTOR_L_EN, PWM_CH_L);
+  ledcAttachPin(MOTOR_R_EN, PWM_CH_R);
+}
+
+void setMotors(int leftPWM, int rightPWM) {
+  // Left
+  if (leftPWM >= 0) {
+    digitalWrite(MOTOR_L_IN1, HIGH);
+    digitalWrite(MOTOR_L_IN2, LOW);
+  } else {
+    digitalWrite(MOTOR_L_IN1, LOW);
+    digitalWrite(MOTOR_L_IN2, HIGH);
+    leftPWM = -leftPWM;
+  }
+  ledcWrite(PWM_CH_L, constrain(leftPWM, 0, 255));
+
+  // Right
+  if (rightPWM >= 0) {
+    digitalWrite(MOTOR_R_IN1, HIGH);
+    digitalWrite(MOTOR_R_IN2, LOW);
+  } else {
+    digitalWrite(MOTOR_R_IN1, LOW);
+    digitalWrite(MOTOR_R_IN2, HIGH);
+    rightPWM = -rightPWM;
+  }
+  ledcWrite(PWM_CH_R, constrain(rightPWM, 0, 255));
+}
+
+void stopMotors() {
+  ledcWrite(PWM_CH_L, 0);
+  ledcWrite(PWM_CH_R, 0);
+  digitalWrite(MOTOR_L_IN1, LOW);
+  digitalWrite(MOTOR_L_IN2, LOW);
+  digitalWrite(MOTOR_R_IN1, LOW);
+  digitalWrite(MOTOR_R_IN2, LOW);
+}
+
+// ── PID Heading Correction ──
+float pidIntegral = 0;
+float pidLastErr = 0;
+float targetYaw = 0;
+
+void driveForwardPID() {
+  float error = targetYaw - yaw;
+  pidIntegral += error;
+  pidIntegral = constrain(pidIntegral, -500.0f, 500.0f);
+  float derivative = error - pidLastErr;
+  pidLastErr = error;
+
+  float correction = HEADING_KP * error + HEADING_KI * pidIntegral + HEADING_KD * derivative;
+  correction = constrain(correction, -40.0f, 40.0f);
+
+  int leftPWM = BASE_SPEED - (int)correction;
+  int rightPWM = BASE_SPEED + (int)correction;
+
+  leftPWM = constrain(leftPWM, 0, MAX_SPEED);
+  rightPWM = constrain(rightPWM, 0, MAX_SPEED);
+
+  setMotors(leftPWM, rightPWM);
+}
+
+// ── State ──
+bool running = false;
+unsigned long runStart = 0;
+unsigned long lastPrint = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n═══════════════════════════════════════");
+  Serial.println("  DIAGNOSTIC TEST — Motor + IMU + Enc");
+  Serial.println("═══════════════════════════════════════");
+  Serial.println("Commands:");
+  Serial.println("  'g' = GO (drive straight 5 sec)");
+  Serial.println("  's' = STOP");
+  Serial.println("  'l' = Left motor only (2 sec)");
+  Serial.println("  'r' = Right motor only (2 sec)");
+  Serial.println("  'i' = Print sensor snapshot");
+  Serial.println("═══════════════════════════════════════\n");
+
+  // Motors
+  setupMotors();
+  stopMotors();
+
+  // Encoders
+  pinMode(ENC_L_A, INPUT_PULLUP);
+  pinMode(ENC_L_B, INPUT_PULLUP);
+  pinMode(ENC_R_A, INPUT_PULLUP);
+  pinMode(ENC_R_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_L_A), isrL, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_A), isrR, RISING);
+
+  // IR Sensors
+  pinMode(IR_LEFT, INPUT);
+  pinMode(IR_RIGHT, INPUT);
+  pinMode(IR_REAR_LEFT, INPUT);
+  pinMode(IR_REAR_RIGHT, INPUT);
+
+  // IMU
+  initMPU();
+
+  Serial.println("\n[READY] Send 'g' to start driving straight.\n");
+}
+
+void printStatus() {
+  bool fl = (digitalRead(IR_LEFT) == EDGE_ACTIVE);
+  bool fr = (digitalRead(IR_RIGHT) == EDGE_ACTIVE);
+  bool rl = (digitalRead(IR_REAR_LEFT) == EDGE_ACTIVE);
+  bool rr = (digitalRead(IR_REAR_RIGHT) == EDGE_ACTIVE);
+
+  float distL = encTicksL * CM_PER_TICK;
+  float distR = encTicksR * CM_PER_TICK;
+
+  Serial.printf("YAW:%6.1f° | TicksL:%5ld TicksR:%5ld | DistL:%5.1fcm DistR:%5.1fcm | IR F[%c%c] R[%c%c]\n",
+    yaw,
+    encTicksL, encTicksR,
+    distL, distR,
+    fl ? 'X' : '.', fr ? 'X' : '.',
+    rl ? 'X' : '.', rr ? 'X' : '.'
+  );
+}
+
+void loop() {
+  updateMPU();
+
+  // Serial commands
+  if (Serial.available()) {
+    char c = Serial.read();
+    
+    if (c == 'g' || c == 'G') {
+      Serial.println("\n>>> GO — Driving straight for 5 seconds <<<");
+      encTicksL = 0;
+      encTicksR = 0;
+      yaw = 0;
+      targetYaw = 0;
+      pidIntegral = 0;
+      pidLastErr = 0;
+      running = true;
+      runStart = millis();
+    }
+    else if (c == 's' || c == 'S') {
+      stopMotors();
+      running = false;
+      Serial.println("\n>>> STOPPED <<<");
+      printStatus();
+    }
+    else if (c == 'l' || c == 'L') {
+      Serial.println("\n>>> LEFT MOTOR ONLY (2 sec) <<<");
+      encTicksL = 0;
+      setMotors(BASE_SPEED, 0);
+      delay(2000);
+      stopMotors();
+      Serial.printf("Left ticks: %ld (%.1f cm)\n", encTicksL, encTicksL * CM_PER_TICK);
+    }
+    else if (c == 'r' || c == 'R') {
+      Serial.println("\n>>> RIGHT MOTOR ONLY (2 sec) <<<");
+      encTicksR = 0;
+      setMotors(0, BASE_SPEED);
+      delay(2000);
+      stopMotors();
+      Serial.printf("Right ticks: %ld (%.1f cm)\n", encTicksR, encTicksR * CM_PER_TICK);
+    }
+    else if (c == 'i' || c == 'I') {
+      printStatus();
+    }
+  }
+
+  // Drive with PID
+  if (running) {
+    driveForwardPID();
+
+    // Print every 100ms
+    if (millis() - lastPrint >= 100) {
+      lastPrint = millis();
+      printStatus();
+    }
+
+    // Auto-stop after 5 seconds
+    if (millis() - runStart >= 5000) {
+      stopMotors();
+      running = false;
+      Serial.println("\n>>> AUTO-STOP (5 sec elapsed) <<<");
+      printStatus();
+    }
+  }
+
+  delay(5);
+}
